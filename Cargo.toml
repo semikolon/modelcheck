@@ -1,0 +1,20 @@
+[package]
+name = "modelcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Fast one-shot cross-provider LLM model info lookup (availability + pricing + context) — kills the wrongly-assumed-unavailable / wrong-price failure class"
+repository = "https://github.com/semikolon/modelcheck"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[profile.dev]
+split-debuginfo = "unpacked"
