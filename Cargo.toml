@@ -1,6 +1,6 @@
 [package]
 name = "modelcheck"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Fast one-shot cross-provider LLM model info lookup (availability + pricing + context) — kills the wrongly-assumed-unavailable / wrong-price failure class"
 repository = "https://github.com/semikolon/modelcheck"

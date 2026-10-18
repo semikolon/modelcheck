@@ -24,6 +24,10 @@ into one row per model:
 
 - **Default view**: one canonical row per model, first-party provider preferred
   (Anthropic/OpenAI/Google over resellers). Shows `via <provider> +N more`.
+  The model you named sorts first, then first-party rows, then the rest;
+  reseller-prefixed ids (`databricks-gemini-3-5-flash`) fold into the canonical
+  row, and an OpenRouter `-preview` id attaches to the models.dev row when that
+  one carries no suffix (`gemini-3-1-pro` ⇐ `google/gemini-3.1-pro-preview`).
 - **`--all`**: every per-provider variant (Bedrock regional profiles, gateways).
 - **Failure-tolerant**: each source is independently timed out (8s); a dead
   source shows `n/a`, never crashes the command.

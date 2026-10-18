@@ -119,6 +119,7 @@ fn canonical_id(raw: &str) -> String {
         "amazon",
         "meta",
         "mistralai",
+        "databricks",
     ] {
         if let Some(rest) = c.strip_prefix(p) {
             // only when a separator follows, so "openai-o3" strips but "meta-llama" is intact-ish
@@ -165,9 +166,13 @@ struct ModelRow {
 }
 
 impl ModelRow {
-    // Deterministic ordering key.
-    fn sort_key(&self) -> String {
-        self.id.to_lowercase()
+    // Deterministic ordering key: the id that IS the query first, then
+    // first-party rows before resellers, then alphabetical.
+    fn sort_key(&self, needle: &str) -> (bool, usize, String) {
+        let id = self.id.to_lowercase();
+        let bare = norm(&id);
+        let bare = bare.strip_suffix(" preview").unwrap_or(&bare);
+        (bare != needle, self.md_provider_rank, id)
     }
 }
 
@@ -295,8 +300,11 @@ async fn run(needle: String, json_mode: bool, all_mode: bool) -> i32 {
         None => {}
     }
 
+    if !all_mode {
+        fold_preview_twins(&mut rows);
+    }
     let mut list: Vec<ModelRow> = rows.into_values().collect();
-    list.sort_by_key(|a| a.sort_key());
+    list.sort_by_key(|a| a.sort_key(&needle));
 
     if json_mode {
         print_json(&list, &source_errors, aa_key.is_some());
@@ -338,6 +346,40 @@ async fn run(needle: String, json_mode: bool, all_mode: bool) -> i32 {
         );
     }
     0
+}
+
+// A models.dev id often lacks the "-preview" suffix that OpenRouter carries
+// ("gemini-3-1-pro" vs "google/gemini-3.1-pro-preview"). When the exact key is
+// absent but the suffix-stripped one already exists, attach to that row.
+fn attach_key(key: String, all_mode: bool, rows: &BTreeMap<String, ModelRow>) -> String {
+    if all_mode || rows.contains_key(&key) {
+        return key;
+    }
+    match key.strip_suffix("-preview") {
+        Some(base) if rows.contains_key(base) => base.to_string(),
+        _ => key,
+    }
+}
+
+// A reseller lists "gemini-3-1-pro" while Google lists "gemini-3-1-pro-preview":
+// one model under two keys. Fold the reseller-only key into the first-party
+// preview row so one row answers the query.
+fn fold_preview_twins(rows: &mut BTreeMap<String, ModelRow>) {
+    let keys: Vec<String> = rows.keys().cloned().collect();
+    for k in keys {
+        let twin = format!("{k}-preview");
+        let reseller_only = rows
+            .get(&k)
+            .map(|r| r.md_provider_rank == usize::MAX)
+            .unwrap_or(false);
+        if reseller_only && rows.contains_key(&twin) {
+            if let Some(r) = rows.remove(&k) {
+                let t = rows.get_mut(&twin).expect("twin exists");
+                t.md_provider_count += r.md_provider_count;
+                t.on_openrouter |= r.on_openrouter;
+            }
+        }
+    }
 }
 
 // ---------- merge: models.dev ----------
@@ -449,7 +491,11 @@ fn merge_openrouter(
         } else {
             canonical_id(id)
         };
-        let row = rows.entry(key).or_default();
+        let key = attach_key(key, all_mode, rows);
+        let row = rows.entry(key).or_insert_with(|| ModelRow {
+            md_provider_rank: usize::MAX,
+            ..Default::default()
+        });
         if row.id.is_empty() {
             row.id = if all_mode {
                 id.to_string()
@@ -725,4 +771,62 @@ fn print_json(list: &[ModelRow], errors: &[String], aa_enabled: bool) {
         "models": arr,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reseller_prefix_folds_into_the_canonical_id() {
+        assert_eq!(canonical_id("databricks-gemini-3-5-flash"), "gemini-3-5-flash");
+        assert_eq!(canonical_id("google/gemini-3.5-flash"), "gemini-3-5-flash");
+    }
+
+    #[test]
+    fn the_queried_model_sorts_before_lookalikes_and_resellers() {
+        let needle = norm("gemini-3.5-flash");
+        let row = |id: &str, rank: usize| ModelRow {
+            id: id.to_string(),
+            md_provider_rank: rank,
+            ..Default::default()
+        };
+        let mut v = vec![
+            row("aihubmix-gemini-3-5-flash", usize::MAX),
+            row("gemini-3-5-flash-lite", 2),
+            row("gemini-3-5-flash", 2),
+        ];
+        v.sort_by_key(|r| r.sort_key(&needle));
+        let ids: Vec<&str> = v.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["gemini-3-5-flash", "gemini-3-5-flash-lite", "aihubmix-gemini-3-5-flash"]
+        );
+    }
+
+    #[test]
+    fn a_reseller_only_key_folds_into_the_first_party_preview_row() {
+        let mut rows: BTreeMap<String, ModelRow> = BTreeMap::new();
+        rows.insert("gemini-3-1-pro".into(), ModelRow { md_provider_rank: usize::MAX, md_provider_count: 3, ..Default::default() });
+        rows.insert("gemini-3-1-pro-preview".into(), ModelRow { md_provider_rank: 2, md_provider_count: 1, ..Default::default() });
+        fold_preview_twins(&mut rows);
+        assert!(!rows.contains_key("gemini-3-1-pro"));
+        assert_eq!(rows["gemini-3-1-pro-preview"].md_provider_count, 4);
+        // the query "gemini-3.1-pro" still counts the preview row as the exact hit
+        let needle = norm("gemini-3.1-pro");
+        let row = ModelRow { id: "gemini-3-1-pro-preview".into(), md_provider_rank: 2, ..Default::default() };
+        assert!(!row.sort_key(&needle).0);
+    }
+
+    #[test]
+    fn an_openrouter_preview_id_attaches_to_the_suffixless_row() {
+        let mut rows: BTreeMap<String, ModelRow> = BTreeMap::new();
+        rows.insert("gemini-3-1-pro".into(), ModelRow::default());
+        assert_eq!(attach_key("gemini-3-1-pro-preview".into(), false, &rows), "gemini-3-1-pro");
+        // a preview that models.dev also lists stays its own row
+        rows.insert("gemini-3-flash-preview".into(), ModelRow::default());
+        assert_eq!(attach_key("gemini-3-flash-preview".into(), false, &rows), "gemini-3-flash-preview");
+        // --all keeps every raw id apart
+        assert_eq!(attach_key("gemini-3-1-pro-preview".into(), true, &rows), "gemini-3-1-pro-preview");
+    }
 }
